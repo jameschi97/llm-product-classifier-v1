@@ -38,16 +38,16 @@ except ImportError as e:
 
 from dotenv import load_dotenv
 
-from config.exceptions import PipelineError
 from config.loader import PipelineConfig, load_config
 from db.db_connector import DBConnector
 from helpers.data_operations import (
     JsonManager,
     validate_classification_output,
 )
-from services import AzureClient, Batcher, Parser, PromptBuilder, run_classification
+from services import build_batcher, run_classification
 from utils.logging import get_logger, init_logging
 from utils.console import console
+from utils.run_guard import run_guarded
 
 
 # Test mode data directories (located in project root's data folder)
@@ -129,27 +129,7 @@ def classify_data(df: pd.DataFrame, cfg: PipelineConfig) -> float:
 
     signal.signal(signal.SIGINT, _on_interrupt)
 
-    client = AzureClient.from_env(
-        system_message=cfg.prompt.system_message,
-        max_rpm=cfg.max_rpm,
-    )
-    if client is None:
-        raise PipelineError("Azure OpenAI not configured (missing env vars)")
-
-    logger.info(
-        "Azure client initialized: deployment=%s, rate_limit=%d RPM",
-        client.deployment,
-        cfg.max_rpm,
-    )
-
-    builder = PromptBuilder(
-        context_columns=cfg.context_columns,
-        instructions_template=cfg.prompt.instructions_template,
-        response_key=cfg.prompt.response_key,
-        fallback_label=cfg.fallback_label,
-    )
-    parser = Parser(response_key=cfg.prompt.response_key)
-    batcher = Batcher(client=client, parser=parser, builder=builder)
+    batcher = build_batcher(cfg)
 
     run_classification(
         batcher,
@@ -191,73 +171,51 @@ def classify_data(df: pd.DataFrame, cfg: PipelineConfig) -> float:
     return elapsed
 
 
-def run_test_mode() -> int:
-    """
-    Run the test mode pipeline.
-
-    This is the original pipeline behavior:
-    - Downloads data from DB to local JSON
-    - Classifies products locally
-    - Saves results to local JSON
-    - NEVER writes to database
-
-    Returns exit code.
-    """
+def _run() -> int:
     pipeline_start = time.time()
+    load_dotenv()
+    cfg = load_config()
+    row_limit = cfg.test_row_limit
 
-    try:
-        load_dotenv()
-        cfg = load_config()
-        row_limit = cfg.test_row_limit
+    logger.info(
+        "[TEST MODE] Pipeline starting with config: schema=%s, table=%s, "
+        "limit=%d, batch_size=%d",
+        cfg.source.schema,
+        cfg.source.table,
+        row_limit,
+        cfg.batch_size,
+    )
 
-        logger.info(
-            "[TEST MODE] Pipeline starting with config: schema=%s, table=%s, "
-            "limit=%d, batch_size=%d",
-            cfg.source.schema,
-            cfg.source.table,
-            row_limit,
-            cfg.batch_size,
-        )
+    console.start(
+        "Test Mode Pipeline",
+        f"Connecting to [{cfg.source.schema}].[{cfg.source.table}]...",
+    )
 
-        console.start(
-            "Test Mode Pipeline",
-            f"Connecting to [{cfg.source.schema}].[{cfg.source.table}]...",
-        )
+    connector = DBConnector()
+    connector.connect_and_verify(schema=cfg.source.schema, table=cfg.source.table)
 
-        connector = DBConnector()
-        connector.connect_and_verify(schema=cfg.source.schema, table=cfg.source.table)
+    rows, cols, export_time = export_data(connector, cfg, row_limit)
+    console.data_loaded(
+        source=f"[{cfg.source.schema}].[{cfg.source.table}]",
+        rows=rows,
+        columns=cols,
+        elapsed=export_time,
+    )
 
-        rows, cols, export_time = export_data(connector, cfg, row_limit)
-        console.data_loaded(
-            source=f"[{cfg.source.schema}].[{cfg.source.table}]",
-            rows=rows,
-            columns=cols,
-            elapsed=export_time,
-        )
+    df = load_json_data(TEST_INPUT_JSON, target_col=cfg.target.column)
+    classify_data(df, cfg)
 
-        df = load_json_data(TEST_INPUT_JSON, target_col=cfg.target.column)
-        classify_data(df, cfg)
+    total_elapsed = time.time() - pipeline_start
+    logger.info("[TEST MODE] Pipeline finished successfully in %.1fs", total_elapsed)
+    logger.info("[TEST MODE] Output saved to: %s", TEST_OUTPUT_JSON)
+    console.pipeline_finished(success=True)
+    return 0
 
-        total_elapsed = time.time() - pipeline_start
-        logger.info("[TEST MODE] Pipeline finished successfully in %.1fs", total_elapsed)
-        logger.info("[TEST MODE] Output saved to: %s", TEST_OUTPUT_JSON)
-        console.pipeline_finished(success=True)
-        return 0
 
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        console.interrupted()
-        return 130
-    except PipelineError as e:
-        logger.error("Pipeline error: %s", e)
-        console.error("Pipeline Error", str(e))
-        console.pipeline_finished(success=False)
-        return 1
-    except Exception as e:
-        logger.exception("Unexpected error: %s", e)
-        console.error("Unexpected Error", str(e))
-        console.pipeline_finished(success=False)
-        return 1
+def run_test_mode() -> int:
+    """Run the test mode pipeline: export a DB sample to JSON, classify it locally,
+    save the results. NEVER writes to the database. Returns the exit code."""
+    return run_guarded(_run)
 
 
 if __name__ == "__main__":

@@ -26,17 +26,29 @@ import time
 import pandas as pd
 from dotenv import load_dotenv
 
-from config.exceptions import PipelineError
 from config.loader import PipelineConfig, load_config
 from db.db_connector import DBConnector
-from services import AzureClient, Batcher, Parser, PromptBuilder, run_classification
+from services import Batcher, build_batcher, run_classification
 from utils.logging import get_logger, init_logging
 from utils.console import console
+from utils.run_guard import run_guarded
 
 
 # -------------------- Setup -------------------- #
 init_logging("main")
 logger = get_logger(__name__)
+
+
+def _collect_updates(df: pd.DataFrame, cfg: PipelineConfig) -> list[dict]:
+    """Rows that now have a label, as [{primary_key: value, "label": value}]."""
+    pk = cfg.source.primary_key
+    updates = []
+    for _, row in df.iterrows():
+        label_value = row.get(cfg.target.column)
+        pk_value = row.get(pk)
+        if pd.notna(label_value) and label_value != "" and pk_value is not None:
+            updates.append({pk: pk_value, "label": label_value})
+    return updates
 
 
 def classify_batch_and_update(
@@ -56,8 +68,6 @@ def classify_batch_and_update(
         return 0
 
     target_col = cfg.target.column
-
-    # Add target column if missing
     if target_col not in df.columns:
         df[target_col] = None
 
@@ -78,21 +88,12 @@ def classify_batch_and_update(
         display_row_offset=row_offset,
     )
 
-    # Prepare updates for DB
-    updates = []
-    for _, row in df.iterrows():
-        label_value = row.get(target_col)
-        pk_value = row.get(cfg.source.primary_key)
-
-        if pd.notna(label_value) and label_value != "" and pk_value is not None:
-            updates.append({cfg.source.primary_key: pk_value, "label": label_value})
-
+    updates = _collect_updates(df, cfg)
     if not updates:
         logger.warning("No classifications to update")
         return 0
 
-    # Write back to DB
-    updated = connector.update_classifications(
+    return connector.update_classifications(
         updates,
         table=cfg.source.table,
         schema=cfg.source.schema,
@@ -100,172 +101,123 @@ def classify_batch_and_update(
         primary_key=cfg.source.primary_key,
     )
 
-    return updated
 
+def _process_batches(
+    connector: DBConnector,
+    batcher: Batcher,
+    cfg: PipelineConfig,
+    total_unclassified: int,
+) -> int:
+    """Fetch, classify and write back batches until none are left. Returns rows updated."""
+    total_updated = 0
+    batch_num = 0
+    rows_processed = 0
+    total_batches = (total_unclassified + cfg.batch_size - 1) // cfg.batch_size
+    console.classification_start(total_unclassified, cfg.batch_size, total_unclassified)
 
-def main() -> int:
-    """
-    Run the production pipeline.
+    while True:
+        batch_num += 1
+        batch_start = time.time()
 
-    Fetches unclassified rows from DB, classifies them, and writes back.
-    Only updates rows where target column is NULL or empty.
-
-    Returns exit code.
-    """
-    pipeline_start = time.time()
-
-    try:
-        load_dotenv()
-        cfg = load_config()
-
-        logger.info("[PRODUCTION MODE] Pipeline starting")
-        logger.info(
-            "Config: schema=%s, table=%s, target=%s, batch_size=%d, pk=%s",
-            cfg.source.schema,
-            cfg.source.table,
-            cfg.target.column,
-            cfg.batch_size,
-            cfg.source.primary_key,
-        )
-
-        console.start(
-            "Production Pipeline",
-            f"Connecting to [{cfg.source.schema}].[{cfg.source.table}]...",
-        )
-
-        # Initialize DB connection
-        connector = DBConnector()
-        connector.connect_and_verify(schema=cfg.source.schema, table=cfg.source.table)
-
-        # Count unclassified rows
-        total_unclassified = connector.count_unclassified_rows(
+        # Always offset=0: updated rows drop out of the "unclassified" query
+        df = connector.fetch_unclassified_batch(
+            batch_size=cfg.batch_size,
+            offset=0,
             table=cfg.source.table,
             schema=cfg.source.schema,
             target_col=cfg.target.column,
+            primary_key=cfg.source.primary_key,
         )
+        if df.empty:
+            logger.info("No more unclassified rows. Stopping.")
+            break
 
-        if total_unclassified == 0:
-            logger.info("No unclassified rows found. Nothing to do.")
-            console.info("Complete", "No unclassified rows found.")
-            console.pipeline_finished(success=True)
-            return 0
-
-        logger.info("Found %d unclassified rows to process", total_unclassified)
-        console.info("Unclassified Rows", f"{total_unclassified} rows to process")
-
-        # Initialize LLM client
-        client = AzureClient.from_env(
-            system_message=cfg.prompt.system_message,
-            max_rpm=cfg.max_rpm,
+        logger.info("Processing batch %d: %d rows", batch_num, len(df))
+        updated = classify_batch_and_update(
+            connector,
+            df,
+            batcher,
+            cfg,
+            batch_num=batch_num,
+            total_batches=total_batches,
+            row_offset=rows_processed,
         )
-        if client is None:
-            raise PipelineError("Azure OpenAI not configured (missing env vars)")
+        total_updated += updated
+        rows_processed += len(df)
 
         logger.info(
-            "Azure client initialized: deployment=%s, rate_limit=%d RPM",
-            client.deployment,
-            cfg.max_rpm,
+            "Batch %d complete: %d updated in %.1fs. Total: %d/%d. Remaining: ~%d",
+            batch_num,
+            updated,
+            time.time() - batch_start,
+            total_updated,
+            total_unclassified,
+            total_unclassified - total_updated,
         )
 
-        builder = PromptBuilder(
-            context_columns=cfg.context_columns,
-            instructions_template=cfg.prompt.instructions_template,
-            response_key=cfg.prompt.response_key,
-            fallback_label=cfg.fallback_label,
-        )
-        parser = Parser(response_key=cfg.prompt.response_key)
-        batcher = Batcher(client=client, parser=parser, builder=builder)
-
-        # Process in batches
-        total_updated = 0
-        batch_num = 0
-        rows_processed = 0
-
-        # Calculate total batches for progress
-        total_batches = (total_unclassified + cfg.batch_size - 1) // cfg.batch_size
-        console.classification_start(
-            total_unclassified, cfg.batch_size, total_unclassified
-        )
-
-        while True:
-            batch_num += 1
-            batch_start = time.time()
-
-            # Fetch batch of unclassified rows
-            # Always offset=0 since we update rows (they won't appear in next query)
-            df = connector.fetch_unclassified_batch(
-                batch_size=cfg.batch_size,
-                offset=0,
-                table=cfg.source.table,
-                schema=cfg.source.schema,
-                target_col=cfg.target.column,
-                primary_key=cfg.source.primary_key,
+        # Safety: rows fetched but none updated would loop forever
+        if updated == 0 and len(df) > 0:
+            logger.warning(
+                "Batch had %d rows but 0 updates. Breaking to avoid infinite loop.",
+                len(df),
             )
+            break
 
-            if df.empty:
-                logger.info("No more unclassified rows. Stopping.")
-                break
+    return total_updated
 
-            logger.info("Processing batch %d: %d rows", batch_num, len(df))
 
-            # Classify and update
-            updated = classify_batch_and_update(
-                connector,
-                df,
-                batcher,
-                cfg,
-                batch_num=batch_num,
-                total_batches=total_batches,
-                row_offset=rows_processed,
-            )
-            total_updated += updated
-            rows_processed += len(df)
+def _run() -> int:
+    pipeline_start = time.time()
+    load_dotenv()
+    cfg = load_config()
 
-            batch_elapsed = time.time() - batch_start
-            remaining = total_unclassified - total_updated
+    logger.info("[PRODUCTION MODE] Pipeline starting")
+    logger.info(
+        "Config: schema=%s, table=%s, target=%s, batch_size=%d, pk=%s",
+        cfg.source.schema,
+        cfg.source.table,
+        cfg.target.column,
+        cfg.batch_size,
+        cfg.source.primary_key,
+    )
+    console.start(
+        "Production Pipeline",
+        f"Connecting to [{cfg.source.schema}].[{cfg.source.table}]...",
+    )
 
-            logger.info(
-                "Batch %d complete: %d updated in %.1fs. Total: %d/%d. Remaining: ~%d",
-                batch_num,
-                updated,
-                batch_elapsed,
-                total_updated,
-                total_unclassified,
-                remaining,
-            )
+    connector = DBConnector()
+    connector.connect_and_verify(schema=cfg.source.schema, table=cfg.source.table)
 
-            # Safety: if we updated 0 rows but had rows in batch, something is wrong
-            if updated == 0 and len(df) > 0:
-                logger.warning(
-                    "Batch had %d rows but 0 updates. Breaking to avoid infinite loop.",
-                    len(df),
-                )
-                break
-
-        total_elapsed = time.time() - pipeline_start
-
-        logger.info("[PRODUCTION MODE] Pipeline complete in %.1fs", total_elapsed)
-        logger.info("Total rows updated: %d", total_updated)
-        logger.info("Rate limiter stats: %s", client.rate_limiter_stats)
-
-        console.info("Complete", f"Updated {total_updated} rows in {total_elapsed:.1f}s")
+    total_unclassified = connector.count_unclassified_rows(
+        table=cfg.source.table,
+        schema=cfg.source.schema,
+        target_col=cfg.target.column,
+    )
+    if total_unclassified == 0:
+        logger.info("No unclassified rows found. Nothing to do.")
+        console.info("Complete", "No unclassified rows found.")
         console.pipeline_finished(success=True)
         return 0
 
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        console.interrupted()
-        return 130
-    except PipelineError as e:
-        logger.error("Pipeline error: %s", e)
-        console.error("Pipeline Error", str(e))
-        console.pipeline_finished(success=False)
-        return 1
-    except Exception as e:
-        logger.exception("Unexpected error: %s", e)
-        console.error("Unexpected Error", str(e))
-        console.pipeline_finished(success=False)
-        return 1
+    logger.info("Found %d unclassified rows to process", total_unclassified)
+    console.info("Unclassified Rows", f"{total_unclassified} rows to process")
+
+    batcher = build_batcher(cfg)
+    total_updated = _process_batches(connector, batcher, cfg, total_unclassified)
+
+    total_elapsed = time.time() - pipeline_start
+    logger.info("[PRODUCTION MODE] Pipeline complete in %.1fs", total_elapsed)
+    logger.info("Total rows updated: %d", total_updated)
+    logger.info("Rate limiter stats: %s", batcher.client.rate_limiter_stats)
+
+    console.info("Complete", f"Updated {total_updated} rows in {total_elapsed:.1f}s")
+    console.pipeline_finished(success=True)
+    return 0
+
+
+def main() -> int:
+    """Run the production pipeline. Returns the exit code."""
+    return run_guarded(_run)
 
 
 if __name__ == "__main__":

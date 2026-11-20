@@ -6,11 +6,13 @@ Exports:
     Batcher: Iterates over unclassified dataframe rows in batches.
     Parser: Extracts JSON classification outputs from model responses.
     run_classification: High-level helper applying classifications to a DataFrame.
+    build_batcher: Builds a ready-to-use Batcher from a PipelineConfig.
 """
 
 from .azure_client import AzureClient
 from .prompt_builder import PromptBuilder
 from .classification_orchestrator import Batcher, Parser, run_classification
+from .factory import build_batcher
 
 __all__ = [
     "AzureClient",
@@ -18,4 +20,5 @@ __all__ = [
     "Batcher",
     "Parser",
     "run_classification",
-]
+    "build_batcher",
+]

@@ -389,16 +389,19 @@ llm-classifies-data/
 │   │   └── db_connector.py             # Azure SQL: connect, fetch unclassified, update
 │   ├── helpers/
 │   │   └── data_operations.py          # JsonManager, output validation helpers
-│   ├── services/llm/
+│   ├── services/
 │   │   ├── azure_client.py             # Azure OpenAI REST client
+│   │   ├── factory.py                  # build_batcher: wires client, prompt builder, parser from config
 │   │   ├── prompt_builder.py           # Assembles per-batch prompts from config
 │   │   └── classification_orchestrator.py  # Batcher, Parser, run_classification
 │   └── utils/
 │       ├── console.py                  # Formatted terminal output
+│       ├── run_guard.py                # run_guarded: exit codes and console message on failure
 │       ├── logging.py                  # File + console structured logging
 │       └── rate_limiter.py             # Token-bucket RPM rate limiter
 │
 ├── tests/
+│   ├── test_logic.py                   # Offline unit tests (no DB, no Azure): python -m unittest tests.test_logic
 │   └── test_runner.py                  # Safe test mode — read from DB, write to JSON
 │
 ├── data/
@@ -425,7 +428,7 @@ The pipeline is split into four independent layers. Each layer only depends on t
         ┌──────────────────┼──────────────────┐
         ▼                  ▼                  ▼
 ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐
-│   config/    │  │    db/       │  │     services/llm/    │
+│   config/    │  │    db/       │  │     services/        │
 │  loader.py   │  │ db_connector │  │  azure_client        │
 │  (YAML →     │  │ (fetch/write │  │  prompt_builder      │
 │  dataclass)  │  │  SQL rows)   │  │  orchestrator        │

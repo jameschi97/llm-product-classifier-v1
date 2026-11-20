@@ -116,6 +116,108 @@ class Parser:
         return results
 
 
+def _display_names(batch_df: pd.DataFrame, display_column: str) -> List[str]:
+    """Human-readable names for console output (falls back to 'Row <id>')."""
+    if display_column in batch_df.columns:
+        return batch_df[display_column].fillna("(unknown)").tolist()
+    return [f"Row {rid}" for rid in batch_df["ROW_ID"].tolist()]
+
+
+def _apply_labels(
+    df: pd.DataFrame,
+    parsed: List[Dict[str, Any]],
+    target_col: str,
+    batch_num: int,
+) -> tuple[int, int, Counter]:
+    """Write parsed labels into rows that are still empty.
+
+    Returns (applied, rejected, label_counts). A label is rejected when its row
+    is unknown or already classified.
+    """
+    applied = 0
+    rejected = 0
+    label_counts: Counter = Counter()
+    for obj in parsed:
+        row_id = obj.get("row_id")
+        label = obj.get("label")
+        if not (isinstance(row_id, int) and isinstance(label, str)):
+            continue
+        if row_id in df.index and pd.isna(df.at[row_id, target_col]):
+            df.at[row_id, target_col] = label
+            label_counts[label] += 1
+            applied += 1
+        else:
+            rejected += 1
+            logger.warning(
+                "Batch %d: row_id %d not found or already classified",
+                batch_num,
+                row_id,
+            )
+    return applied, rejected, label_counts
+
+
+def _product_results(
+    row_ids: List[int], names: List[str], parsed: List[Dict[str, Any]]
+) -> List[Dict[str, str]]:
+    """Per-product (name, assigned label) pairs shown in the console."""
+    assigned = {
+        obj["row_id"]: obj.get("label", "")
+        for obj in parsed
+        if isinstance(obj.get("row_id"), int)
+    }
+    return [
+        {
+            "product": str(names[i] if i < len(names) else f"Row {rid}"),
+            "segment": assigned.get(rid, "(unclassified)"),
+        }
+        for i, rid in enumerate(row_ids)
+    ]
+
+
+def _save_partial(jm: JsonManager, df: pd.DataFrame, path: Optional[str]) -> None:
+    """Write df to `path` after every batch, so a crash loses at most one batch."""
+    if not path:
+        return
+    try:
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        jm.write(output_path, df)
+        logger.debug("Partial JSON written to %s", path)
+    except Exception as e:
+        logger.warning("Failed to write partial JSON '%s': %s", path, e)
+
+
+def _ask_model(
+    batcher: Batcher,
+    batch_df: pd.DataFrame,
+    context: str,
+    label_names: List[str],
+    label_descriptions: Dict[str, str],
+    batch_num: int,
+) -> tuple[List[Dict[str, Any]], int]:
+    """Prompt the model for one batch. Returns (parsed results, tokens used)."""
+    prompt = batcher.builder.build_classification_prompt(
+        batch_df,
+        context=context,
+        label_names=label_names,
+        label_descriptions=label_descriptions,
+    )
+    logger.debug("Batch %d: prompt length=%d chars", batch_num, len(prompt))
+
+    response_text, usage = batcher.client.send(prompt)
+    tokens_used = usage.get("total_tokens", 0) if usage else 0
+    logger.debug(
+        "Batch %d: response length=%d chars, tokens=%d",
+        batch_num,
+        len(response_text) if response_text else 0,
+        tokens_used,
+    )
+
+    parsed = batcher.parser.parse_classification_response(response_text or "")
+    logger.debug("Batch %d: parsed %d items", batch_num, len(parsed))
+    return parsed, tokens_used
+
+
 def run_classification(
     batcher: Batcher,
     df: pd.DataFrame,
@@ -131,16 +233,15 @@ def run_classification(
     progress_total_batches: Optional[int] = None,
     display_row_offset: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Classify products into the target column."""
-    # Ensure target column exists
+    """Classify products into the target column (modifies df in place)."""
     if target_col not in df.columns:
         df[target_col] = None
-    
+
     total_rows = len(df)
     initial_unclassified = df[target_col].isna().sum()
     total_batches = (initial_unclassified + batch_size - 1) // batch_size
     effective_total_batches = progress_total_batches or total_batches
-    
+
     logger.info(
         "Starting classification: %d total rows, %d unclassified, "
         "batch_size=%d, total_batches=%d",
@@ -149,115 +250,42 @@ def run_classification(
         batch_size,
         total_batches,
     )
-    
-    # Console: show classification start
     if show_console_start:
         console.classification_start(total_rows, batch_size, initial_unclassified)
-    
+
     jm = JsonManager()
     batch_counter = 0
     rows_seen_for_display = 0
-    
+
     for batch_df in batcher.iterate_unclassified_batches(df, target_col, batch_size):
         batch_start_time = time.time()
         batch_num = batch_counter + 1
         global_batch_num = progress_batch_offset + batch_num
         row_ids = batch_df["ROW_ID"].tolist()
-        
-        # Get display names for console output
-        product_names = []
-        if display_column in batch_df.columns:
-            product_names = batch_df[display_column].fillna("(unknown)").tolist()
-        else:
-            product_names = [f"Row {rid}" for rid in row_ids]
-        
-        # Console: show batch start
-        if display_row_offset is not None:
-            row_count = len(batch_df)
-            row_start = display_row_offset + rows_seen_for_display
-            row_ids_for_console = list(range(row_start, row_start + row_count))
-            rows_seen_for_display += row_count
-        else:
-            row_ids_for_console = row_ids
+        names = _display_names(batch_df, display_column)
 
-        console.batch_start(
-            global_batch_num,
-            effective_total_batches,
-            row_ids_for_console,
-            product_names,
-        )
-        
-        # Log detailed batch info
+        # Console row numbers continue from display_row_offset when it is given
+        if display_row_offset is not None:
+            row_start = display_row_offset + rows_seen_for_display
+            console_ids = list(range(row_start, row_start + len(batch_df)))
+            rows_seen_for_display += len(batch_df)
+        else:
+            console_ids = row_ids
+        console.batch_start(global_batch_num, effective_total_batches, console_ids, names)
         logger.debug("Batch %d: row_ids=%s", batch_num, row_ids)
-        logger.debug("Batch %d: display=%s", batch_num, product_names[:3])
-        
-        # Build prompt and send to LLM
-        prompt = batcher.builder.build_classification_prompt(
-            batch_df,
-            context=context,
-            label_names=label_names,
-            label_descriptions=label_descriptions,
+        logger.debug("Batch %d: display=%s", batch_num, names[:3])
+
+        parsed, tokens_used = _ask_model(
+            batcher, batch_df, context, label_names, label_descriptions, batch_num
         )
-        logger.debug("Batch %d: prompt length=%d chars", batch_num, len(prompt))
-        
-        response_text, usage = batcher.client.send(prompt)
-        tokens_used = usage.get("total_tokens", 0) if usage else 0
-        logger.debug(
-            "Batch %d: response length=%d chars, tokens=%d",
-            batch_num,
-            len(response_text) if response_text else 0,
-            tokens_used,
+        applied, rejected, label_counts = _apply_labels(
+            df, parsed, target_col, batch_num
         )
-        
-        # Parse response
-        parsed = batcher.parser.parse_classification_response(response_text or "")
-        logger.debug("Batch %d: parsed %d items", batch_num, len(parsed))
-        
-        # Apply classifications
-        applied = 0
-        failed = 0
-        label_counts: Dict[str, int] = Counter()
-        product_results = []
-        
-        # Create a mapping of row_id to classification for display
-        classification_map = {}
-        for obj in parsed:
-            rid = obj.get("row_id")
-            if isinstance(rid, int):
-                classification_map[rid] = obj.get("label", "")
-        
-        # Apply label to dataframe
-        for obj in parsed:
-            row_id = obj.get("row_id")
-            label = obj.get("label")
-            
-            if isinstance(row_id, int) and isinstance(label, str):
-                if row_id in df.index and pd.isna(df.at[row_id, target_col]):
-                    df.at[row_id, target_col] = label
-                    label_counts[label] += 1
-                    applied += 1
-                else:
-                    failed += 1
-                    logger.warning(
-                        "Batch %d: row_id %d not found or already classified",
-                        batch_num,
-                        row_id,
-                    )
-        
-        failed += len(batch_df) - len(parsed)  # Count unparsed as failed
-        
-        # Build product results for display
-        for idx, row_id in enumerate(row_ids):
-            product_name = product_names[idx] if idx < len(product_names) else f"Row {row_id}"
-            assigned_label = classification_map.get(row_id, "(unclassified)")
-            product_results.append(
-                {"product": str(product_name), "segment": assigned_label}
-            )
-        
+        failed = rejected + (len(batch_df) - len(parsed))  # unparsed rows count too
+
         batch_elapsed = time.time() - batch_start_time
         remaining_unclassified = df[target_col].isna().sum()
-        
-        # Console: show batch result with product mappings
+
         console.batch_result(
             classified=applied,
             requested=len(batch_df),
@@ -265,10 +293,8 @@ def run_classification(
             category_counts=dict(label_counts),
             failed=failed if failed > 0 else 0,
             tokens=tokens_used,
-            product_results=product_results,
+            product_results=_product_results(row_ids, names, parsed),
         )
-        
-        # Log detailed results
         logger.info(
             "Batch %d/%d: %d/%d classified in %.1fs. Labels: %s. Remaining: %d/%d",
             global_batch_num,
@@ -280,19 +306,10 @@ def run_classification(
             remaining_unclassified,
             total_rows,
         )
-        
-        # Save partial output after EVERY batch
-        if partial_output_json:
-            try:
-                output_path = Path(partial_output_json)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                jm.write(output_path, df)
-                logger.debug("Partial JSON written to %s", partial_output_json)
-            except Exception as e:
-                logger.warning("Failed to write partial JSON '%s': %s", partial_output_json, e)
-        
+
+        _save_partial(jm, df, partial_output_json)
         batch_counter += 1
-    
+
     logger.info("Classification loop complete: %d batches processed", batch_counter)
     return df
 
